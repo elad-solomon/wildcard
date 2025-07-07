@@ -143,6 +143,7 @@ struct WildcardMatchingConfig<S> {
     metasymbol_one: Option<S>,
     symbol_escape: Option<S>,
     case_insensitive: bool,
+    path_separator: Option<S>,
 }
 
 impl<S> WildcardMatchingConfig<S>
@@ -171,6 +172,7 @@ where
             metasymbol_one: Some(S::DEFAULT_METASYMBOL_ONE),
             symbol_escape: Some(S::DEFAULT_METASYMBOL_ESCAPE),
             case_insensitive: false,
+            path_separator: None,
         }
     }
 }
@@ -254,6 +256,13 @@ where
     #[must_use]
     pub fn case_insensitive(mut self, on: bool) -> WildcardBuilder<'a, S> {
         self.config.case_insensitive = on;
+        self
+    }
+
+    /// Sets the path separator for path-aware matching. When set, the `*` metasymbol will not match
+    /// across path separators, behaving like UNIX glob.
+    pub fn with_path_separator(mut self, separator: S) -> WildcardBuilder<'a, S> {
+        self.config.path_separator = Some(separator);
         self
     }
 
@@ -673,6 +682,12 @@ where
                 {
                     while input_index < input_len && !symbol_eq(pattern_symbol, input[input_index])
                     {
+                        // If path-aware matching is enabled, stop at path separators
+                        if let Some(path_sep) = config.path_separator {
+                            if symbol_eq(input[input_index], path_sep) {
+                                break;
+                            }
+                        }
                         input_index += 1;
                     }
                 }
@@ -701,6 +716,13 @@ where
                 return false;
             }
 
+            // If path-aware matching is enabled, stop at path separators
+            if let Some(path_sep) = config.path_separator {
+                if symbol_eq(input[revert_input_index], path_sep) {
+                    return false;
+                }
+            }
+
             // We need to backtrack. Let's make the star consume one more symbol.
             revert_input_index += 1;
 
@@ -717,6 +739,12 @@ where
                 while revert_input_index < input_len
                     && !symbol_eq(pattern_symbol, input[revert_input_index])
                 {
+                    // If path-aware matching is enabled, stop at path separators
+                    if let Some(path_sep) = config.path_separator {
+                        if symbol_eq(input[revert_input_index], path_sep) {
+                            break;
+                        }
+                    }
                     revert_input_index += 1;
                 }
             }
@@ -768,20 +796,35 @@ mod tests {
     }
 
     pub mod engine_regex_bytes {
-        use crate::{Wildcard, WildcardToken};
+        use crate::{WildcardBuilder, WildcardToken};
         use alloc::borrow::ToOwned;
+        use alloc::format;
         use alloc::string::String;
+        use alloc::string::ToString;
         use alloc::vec::Vec;
         use regex::bytes::{Regex, RegexBuilder};
 
-        fn make_regex(pattern: &str, case_insensitive: bool) -> Regex {
-            let wildcard = Wildcard::new(pattern.as_bytes()).expect("invalid wildcard");
+        fn make_regex(pattern: &str, case_insensitive: bool, path_separator: Option<u8>) -> Regex {
+            let mut builder = WildcardBuilder::new(pattern.as_bytes());
+            if let Some(sep) = path_separator {
+                builder = builder.with_path_separator(sep);
+            }
+            let wildcard = builder.build().expect("invalid wildcard");
             let mut regex_pattern = "^".to_owned();
 
             for token in wildcard.parsed() {
                 match token {
                     WildcardToken::MetasymbolAny => {
-                        regex_pattern.push_str("(.*?)");
+                        if let Some(sep) = path_separator {
+                            // Use [^/]* instead of .*? for path-aware matching
+                            let sep_char = char::from(sep);
+                            regex_pattern.push_str(&format!(
+                                "([^{}]*?)",
+                                regex::escape(&sep_char.to_string())
+                            ));
+                        } else {
+                            regex_pattern.push_str("(.*?)");
+                        }
                     }
                     WildcardToken::MetasymbolOne => {
                         regex_pattern.push_str("(.)");
@@ -806,7 +849,7 @@ mod tests {
         }
 
         pub fn matches(pattern: &str, input: &[u8], case_insensitive: bool) -> bool {
-            make_regex(pattern, case_insensitive).is_match(input)
+            make_regex(pattern, case_insensitive, None).is_match(input)
         }
 
         pub fn captures<'a>(
@@ -814,7 +857,7 @@ mod tests {
             input: &'a [u8],
             case_insensitive: bool,
         ) -> Option<Vec<&'a [u8]>> {
-            make_regex(pattern, case_insensitive).captures(input).map(|c| {
+            make_regex(pattern, case_insensitive, None).captures(input).map(|c| {
                 c.iter().flat_map(IntoIterator::into_iter).skip(1).map(|m| m.as_bytes()).collect()
             })
         }
@@ -1164,6 +1207,36 @@ mod tests {
         let wildcard = WildcardBuilder::new(&pattern).build().expect("invalid wildcard");
 
         assert_eq!(format!("{wildcard:?}"), r"a*\*?\?");
+    }
+
+    #[test]
+    fn test_path_aware_matching() {
+        // Test path-aware matching with "/" separator
+        let wildcard =
+            WildcardBuilder::new("*.txt".as_bytes()).with_path_separator(b'\\').build().unwrap();
+
+        // Should match files in current directory
+        assert!(wildcard.is_match("file.txt".as_bytes()));
+        assert!(!wildcard.is_match("file.txt.bak".as_bytes()));
+
+        // Should not match files in subdirectories
+        assert!(!wildcard.is_match(r"dir\file.txt".as_bytes()));
+        assert!(!wildcard.is_match(r"dir\subdir\file.txt".as_bytes()));
+
+        // Test with explicit path patterns
+        let wildcard = WildcardBuilder::new(r"*\\*.txt".as_bytes())
+            .with_path_separator(b'\\')
+            .build()
+            .unwrap();
+
+        // Should match files in one level of subdirectory
+        assert!(wildcard.is_match(r"dir\file.txt".as_bytes()));
+        assert!(!wildcard.is_match("file.txt".as_bytes()));
+        assert!(!wildcard.is_match(r"dir\subdir\file.txt".as_bytes()));
+
+        // Test captures
+        let captures = wildcard.captures(r"dir\file.txt".as_bytes()).unwrap();
+        assert_eq!(captures, ["dir".as_bytes(), "file".as_bytes()]);
     }
 
     #[derive(Clone, Debug)]
